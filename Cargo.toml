@@ -1,0 +1,34 @@
+[package]
+name = "sqtoy"
+version = "0.1.0"
+authors = ["David Ayeke"]
+edition = "2018"
+
+[features]
+default = []
+metal = ["gfx-backend-metal"]
+dx12 = ["gfx-backend-dx12"]
+vulkan = ["gfx-backend-vulkan"]
+
+[dependencies]
+log = "0.4.0"
+simple_logger = "1.0"
+winit = "0.18"
+gfx-hal = "0.1"
+arrayvec = "0.4"
+shaderc = "0.3"
+image = "0.21"
+nalgebra-glm = "0.2"
+rand = "0.6"
+
+[dependencies.gfx-backend-vulkan]
+version = "0.1"
+optional = true
+
+[target.'cfg(target_os = "macos")'.dependencies.gfx-backend-metal]
+version = "0.1"
+optional = true
+
+[target.'cfg(windows)'.dependencies.gfx-backend-dx12]
+version = "0.1"
+optional = true
