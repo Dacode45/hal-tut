@@ -1,4 +1,5 @@
 #![allow(clippy::len_zero)]
+#![allow(clippy::many_single_char_names)]
 
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
@@ -11,42 +12,102 @@ use gfx_backend_metal as back;
 use gfx_backend_vulkan as back;
 
 use arrayvec::ArrayVec;
-use core::mem::ManuallyDrop;
+use core::mem::{size_of, ManuallyDrop};
 use gfx_hal::{
-        adapter::{Adapter, PhysicalDevice},
+        adapter::{Adapter, MemoryTypeId, PhysicalDevice},
+        buffer::Usage as BufferUsage,
         command::{ClearColor, ClearValue, CommandBuffer, MultiShot, Primary},
         device::Device,
         format::{Aspects, ChannelType, Format, Swizzle},
         image::{Extent, Layout, SubresourceRange, Usage, ViewKind},
-        pass::{Attachment, AttachmentLoadOp, AttachmentOps, AttachmentStoreOp, SubpassDesc},
+        memory::{Properties, Requirements},
+        pass::{
+                Attachment, AttachmentLoadOp, AttachmentOps, AttachmentStoreOp, Subpass,
+                SubpassDesc,
+        },
         pool::{CommandPool, CommandPoolCreateFlags},
-        pso::{PipelineStage, Rect},
+        pso::{
+                AttributeDesc, BakedStates, BasePipeline, BlendDesc, BlendOp, BlendState,
+                ColorBlendDesc, ColorMask, DepthStencilDesc, DepthTest, DescriptorSetLayoutBinding,
+                Element, EntryPoint, Face, Factor, FrontFace, GraphicsPipelineDesc,
+                GraphicsShaderSet, InputAssemblerDesc, LogicOp, PipelineCreationFlags,
+                PipelineStage, PolygonMode, Rasterizer, Rect, ShaderStageFlags, Specialization,
+                StencilTest, VertexBufferDesc, Viewport,
+        },
         queue::{family::QueueGroup, Submission},
         window::{Backbuffer, Extent2D, FrameSync, PresentMode, Swapchain, SwapchainConfig},
-        Backend, Gpu, Graphics, Instance, QueueFamily, Surface,
+        Backend, Gpu, Graphics, Instance, Primitive, QueueFamily, Surface,
 };
 use winit::{
         dpi::LogicalSize, CreationError, Event, EventsLoop, Window, WindowBuilder, WindowEvent,
 };
 
-pub const WINDOW_NAME: &str = "Hello Clear";
+pub const WINDOW_NAME: &str = "Triangle Intro";
 
+pub const VERTEX_SOURCE: &str = "#version 450
+layout (location = 0) in vec2 position;
+
+out gl_PerVertex {
+  vec4 gl_Position;
+};
+
+void main()
+{
+  gl_Position = vec4(position, 0.0, 1.0);
+}";
+
+pub const FRAGMENT_SOURCE: &str = "#version 450
+layout(location = 0) out vec4 color;
+
+void main()
+{
+  color = vec4(1.0);
+}";
+
+#[derive(Debug, Clone, Copy)]
+/// Describes a triangle
+pub struct Triangle {
+        /// We use a 2D array of xy points.
+        pub points: [[f32; 2]; 3],
+}
+
+impl Triangle {
+        /// We flatten the points into a single buffer of 6 points for buffers
+        pub fn points_flat(self) -> [f32; 6] {
+                let [[a, b], [c, d], [e, f]] = self.points;
+                [a, b, c, d, e, f]
+        }
+}
+
+/// HalState controls the entire cpu-gpu pipeline
 pub struct HalState {
+        buffer: ManuallyDrop<<back::Backend as Backend>::Buffer>,
+        memory: ManuallyDrop<<back::Backend as Backend>::Memory>,
+        descriptor_set_layouts: Vec<<back::Backend as Backend>::DescriptorSetLayout>,
+        pipeline_layout: ManuallyDrop<<back::Backend as Backend>::PipelineLayout>,
+        graphics_pipeline: ManuallyDrop<<back::Backend as Backend>::GraphicsPipeline>,
+        requirements: Requirements,
         // index into the swapchain to use
         current_frame: usize,
         // frames_in_flight is the number of images in the swap_chain
-        // 3 for triplebuffer 2 otherwise
+        // 3 for triplebuffering 2 otherwise
         frames_in_flight: usize,
         // fence to prevent writes to an image before it is done displaying
         in_flight_fences: Vec<<back::Backend as Backend>::Fence>,
+        // This semaphore allows us to pause the swapchain present until the rendering is finished.
+        /// The wait is done by creating a Submission {} with a signal_semaphore using render finished
         render_finished_semaphores: Vec<<back::Backend as Backend>::Semaphore>,
+        /// Semaphore waits on the swapchain for the image to be ready to render
         image_available_semaphores: Vec<<back::Backend as Backend>::Semaphore>,
+        /// Command buffers for eqch frame
         command_buffers: Vec<CommandBuffer<back::Backend, Graphics, MultiShot, Primary>>,
+        // Command pool is a memory allocator for command buffers
         command_pool: ManuallyDrop<CommandPool<back::Backend, Graphics>>,
-
+        // Framebuffers for the image view. Basically a region of memory. Configured by a render pass.
         framebuffers: Vec<<back::Backend as Backend>::Framebuffer>,
         // Only one, we are using a typical 2D image view with just color info
         image_views: Vec<(<back::Backend as Backend>::ImageView)>,
+        // Passed to pipeline and command buffer. Determines what ops are used. What format, layouts, depth, stencil, color attachement etc.
         render_pass: ManuallyDrop<<back::Backend as Backend>::RenderPass>,
         // What part of the extent to render to
         render_area: Rect,
@@ -60,7 +121,9 @@ pub struct HalState {
         // Usually this is a GPU but it could be a software implementation.
         // This is equivalent to a physical device in vulkan
         _adapter: Adapter<back::Backend>,
+        // surface is our winit
         _surface: <back::Backend as Backend>::Surface,
+        // This is the backend
         _instance: ManuallyDrop<back::Instance>,
 }
 impl HalState {
@@ -77,9 +140,9 @@ impl HalState {
                         // go through adapters available on the machine
                         .enumerate_adapters()
                         .into_iter()
+                        // find the first that supports graphics and queue family
                         .find(|a| {
                                 a.queue_families.iter().any(|qf| {
-                                        // find the first that supports graphics and queue family
                                         qf.supports_graphics() && surface.supports_queue_family(qf)
                                 })
                         })
@@ -88,11 +151,12 @@ impl HalState {
                 // Open A Device and take out a QueueGroup from a queue family that supports submitting graphics command
                 // The device is the logical device we use not the physical device(adapter)
                 // the Queue_group is the first queue_group of the adapter queue_family that supports graphics commands
-                let (device, queue_group) = {
+                let (mut device, queue_group) = {
                         // Regain the queue_family
                         let queue_family = adapter
                                 .queue_families
                                 .iter()
+                                // find the first q family that supports graphics and the surface
                                 .find(|qf| {
                                         qf.supports_graphics() && surface.supports_queue_family(qf)
                                 })
@@ -280,6 +344,7 @@ impl HalState {
                 };
 
                 // Create The ImageViews
+                // We get them from the backbuffer assuming it is just a set of images
                 let image_views: Vec<_> = match backbuffer {
                         Backbuffer::Images(images) => {
                                 images.into_iter()
@@ -287,8 +352,11 @@ impl HalState {
                                                 device
             .create_image_view(
               &image,
+              // 2 Dimmensional array
               ViewKind::D2,
+              // color format
               format,
+              // don't need to remap xyz to something rediculus like xzy
               Swizzle::NO,
               SubresourceRange {
                 aspects: Aspects::COLOR,
@@ -306,6 +374,8 @@ impl HalState {
                 };
 
                 // Create Our FrameBuffers
+                // Every image in our backbuffer 3 in the case of tripple buffering
+                // Gets a frame buffer to actually render things to
                 let framebuffers: Vec<<back::Backend as Backend>::Framebuffer> = {
                         image_views
                                 .iter()
@@ -328,6 +398,7 @@ impl HalState {
                 let mut command_pool = unsafe {
                         device.create_command_pool_typed(
                                 &queue_group,
+                                // Not transient (short lived)
                                 CommandPoolCreateFlags::RESET_INDIVIDUAL,
                         )
                         .map_err(|_| "Could not create the raw command pool!")?
@@ -336,10 +407,50 @@ impl HalState {
                 // Create Our CommandBuffers
                 let command_buffers: Vec<_> = framebuffers
                         .iter()
+                        // We use our command pool to acquire memory for our command buffers
                         .map(|_| command_pool.acquire_command_buffer())
                         .collect();
 
+                // Build our pipeline and vertex buffer
+                let (descriptor_set_layouts, pipeline_layout, graphics_pipeline) =
+                        Self::create_pipeline(&mut device, extent, &render_pass)?;
+                let (buffer, memory, requirements) = unsafe {
+                        // Get the exact size of our triangle struct when it is flattened 2D coordinates * 3 coordinates
+                        const F32_XY_TRIANGLE: u64 = (size_of::<f32>() * 2 * 3) as u64;
+                        let mut buffer = device
+                                .create_buffer(F32_XY_TRIANGLE, BufferUsage::VERTEX)
+                                .map_err(|_| "Couldn't create a buffer for the verticies")?;
+                        let mut requirements = device.get_buffer_requirements(&buffer);
+                        let memory_type_id = adapter
+                                .physical_device
+                                // Get memory properties (visability) cpu visible, gpu visible, etc
+                                .memory_properties()
+                                .memory_types
+                                .iter()
+                                .enumerate()
+                                // find memory that is cpu visible
+                                .find(|&(id, memory_type)| {
+                                        requirements.type_mask & (1 << id) != 0
+                                                && memory_type
+                                                        .properties
+                                                        .contains(Properties::CPU_VISIBLE)
+                                })
+                                .map(|(id, _)| MemoryTypeId(id))
+                                .ok_or(
+                                        "Couldn't find a memory type to support the vertex buffer!",
+                                )?;
+                        let memory = device
+                                .allocate_memory(memory_type_id, requirements.size)
+                                .map_err(|_| "Couldn't allocate vertex buffer memory")?;
+                        device.bind_buffer_memory(&memory, 0, &mut buffer)
+                                .map_err(|_| "Couldn't bind the buffer memory!")?;
+                        (buffer, memory, requirements)
+                };
+
                 Ok(Self {
+                        requirements,
+                        buffer: ManuallyDrop::new(buffer),
+                        memory: ManuallyDrop::new(memory),
                         _instance: ManuallyDrop::new(instance),
                         _surface: surface,
                         _adapter: adapter,
@@ -357,7 +468,203 @@ impl HalState {
                         in_flight_fences,
                         frames_in_flight,
                         current_frame: 0,
+                        descriptor_set_layouts,
+                        pipeline_layout: ManuallyDrop::new(pipeline_layout),
+                        graphics_pipeline: ManuallyDrop::new(graphics_pipeline),
                 })
+        }
+
+        #[allow(clippy::type_complexity)]
+        // creates a new rendering pipeline for use in draw and clear functions
+        pub fn create_pipeline(
+                device: &mut back::Device,
+                extent: Extent2D,
+                render_pass: &<back::Backend as Backend>::RenderPass,
+        ) -> Result<
+                (
+                        Vec<<back::Backend as Backend>::DescriptorSetLayout>,
+                        <back::Backend as Backend>::PipelineLayout,
+                        <back::Backend as Backend>::GraphicsPipeline,
+                ),
+                &'static str,
+        > {
+                let mut compiler = shaderc::Compiler::new().ok_or("shaderc not found!")?;
+                let vertex_compile_artifact = compiler
+                        .compile_into_spirv(
+                                VERTEX_SOURCE,
+                                shaderc::ShaderKind::Vertex,
+                                "vertex.vert",
+                                "main",
+                                None,
+                        )
+                        .map_err(|_| "Couldn't compile vertex shader!")?;
+                let fragment_compile_artifact = compiler
+                        .compile_into_spirv(
+                                FRAGMENT_SOURCE,
+                                shaderc::ShaderKind::Fragment,
+                                "fragment.fragment",
+                                "main",
+                                None,
+                        )
+                        .map_err(|e| {
+                                error!("{}", e);
+                                "Couldn't compile fragment shader!"
+                        })?;
+                let vertex_shader_module = unsafe {
+                        device.create_shader_module(vertex_compile_artifact.as_binary_u8())
+                                .map_err(|_| "Couldn't make the vertex module")?
+                };
+                let fragment_shader_module = unsafe {
+                        device.create_shader_module(fragment_compile_artifact.as_binary_u8())
+                                .map_err(|_| "Couldn't make the fragment module")?
+                };
+                let (descriptor_set_layouts, pipeline_layout, gfx_pipeline) = {
+                        let (vs_entry, fs_entry) = (
+                                EntryPoint {
+                                        entry: "main",
+                                        module: &vertex_shader_module,
+                                        specialization: Specialization {
+                                                constants: &[],
+                                                data: &[],
+                                        },
+                                },
+                                EntryPoint {
+                                        entry: "main",
+                                        module: &fragment_shader_module,
+                                        specialization: Specialization {
+                                                constants: &[],
+                                                data: &[],
+                                        },
+                                },
+                        );
+
+                        let shaders = GraphicsShaderSet {
+                                vertex: vs_entry,
+                                hull: None,
+                                domain: None,
+                                geometry: None,
+                                fragment: Some(fs_entry),
+                        };
+
+                        let input_assembler = InputAssemblerDesc::new(Primitive::TriangleList);
+
+                        let vertex_buffers: Vec<VertexBufferDesc> = vec![VertexBufferDesc {
+                                binding: 0,
+                                // 2 coords per vertex
+                                stride: (size_of::<f32>() * 2) as u32,
+                                rate: 0,
+                        }];
+                        let attributes: Vec<AttributeDesc> = vec![AttributeDesc {
+                                location: 0,
+                                binding: 0,
+                                element: Element {
+                                        format: Format::Rg32Float,
+                                        offset: 0,
+                                },
+                        }];
+
+                        let rasterizer = Rasterizer {
+                                depth_clamping: false,
+                                // how the rasterizer should work
+                                polygon_mode: PolygonMode::Fill,
+                                // Backface calling
+                                cull_face: Face::NONE,
+                                // what direction are verticies in
+                                front_face: FrontFace::Clockwise,
+                                //
+                                depth_bias: None,
+                                conservative: false,
+                        };
+
+                        let depth_stencil = DepthStencilDesc {
+                                // don't need depth testing right now
+                                depth: DepthTest::Off,
+                                depth_bounds: false,
+                                stencil: StencilTest::Off,
+                        };
+
+                        let blender = {
+                                let blend_state = BlendState::On {
+                                        color: BlendOp::Add {
+                                                src: Factor::One,
+                                                dst: Factor::Zero,
+                                        },
+                                        alpha: BlendOp::Add {
+                                                src: Factor::One,
+                                                dst: Factor::Zero,
+                                        },
+                                };
+                                BlendDesc {
+                                        logic_op: Some(LogicOp::Copy),
+                                        targets: vec![ColorBlendDesc(ColorMask::ALL, blend_state)],
+                                }
+                        };
+
+                        let baked_states = BakedStates {
+                                viewport: Some(Viewport {
+                                        rect: extent.to_extent().rect(),
+                                        depth: (0.0..1.0),
+                                }),
+                                scissor: Some(extent.to_extent().rect()),
+                                blend_color: None,
+                                depth_bounds: None,
+                        };
+
+                        let bindings = Vec::<DescriptorSetLayoutBinding>::new();
+                        let immutable_samplers = Vec::<<back::Backend as Backend>::Sampler>::new();
+                        let descriptor_set_layouts: Vec<
+                                <back::Backend as Backend>::DescriptorSetLayout,
+                        > = vec![unsafe {
+                                device.create_descriptor_set_layout(bindings, immutable_samplers)
+                                        .map_err(|_| "Couldn't make a DescriptorSetLayout")?
+                        }];
+                        let push_constants =
+                                Vec::<(ShaderStageFlags, core::ops::Range<u32>)>::new();
+                        let layout = unsafe {
+                                device.create_pipeline_layout(
+                                        &descriptor_set_layouts,
+                                        push_constants,
+                                )
+                                .map_err(|_| "Couldn't create a pipeline layout")?
+                        };
+
+                        let gfx_pipeline = {
+                                let desc = GraphicsPipelineDesc {
+                                        shaders,
+                                        rasterizer,
+                                        vertex_buffers,
+                                        attributes,
+                                        input_assembler,
+                                        blender,
+                                        depth_stencil,
+                                        multisampling: None,
+                                        baked_states,
+                                        layout: &layout,
+                                        subpass: Subpass {
+                                                index: 0,
+                                                main_pass: render_pass,
+                                        },
+                                        flags: PipelineCreationFlags::empty(),
+                                        parent: BasePipeline::None,
+                                };
+
+                                unsafe {
+                                        device.create_graphics_pipeline(&desc, None).map_err(
+                                                |_| "Couldn't create a graphics pipeline!",
+                                        )?
+                                }
+                        };
+
+                        (descriptor_set_layouts, layout, gfx_pipeline)
+                };
+
+                unsafe {
+                        // once it's in the pipline get rid of it
+                        device.destroy_shader_module(vertex_shader_module);
+                        device.destroy_shader_module(fragment_shader_module);
+                }
+
+                Ok((descriptor_set_layouts, pipeline_layout, gfx_pipeline))
         }
 
         /// Draw a frame that's just cleared to the color specified.
@@ -423,6 +730,95 @@ impl HalState {
                                 .map_err(|_| "Failed to present into the swapchain!")
                 }
         }
+
+        /// Draw a frame that's just cleared to the color specified.
+        pub fn draw_triangle_frame(&mut self, triangle: Triangle) -> Result<(), &'static str> {
+                // SETUP FOR THIS FRAME
+                let image_available = &self.image_available_semaphores[self.current_frame];
+                let render_finished = &self.render_finished_semaphores[self.current_frame];
+                // Advance the frame before using the `?` operator
+                self.current_frame = (self.current_frame + 1) % self.frames_in_flight;
+
+                // Get the index to the image in the swap chain
+                let (i_u32, i_usize) = unsafe {
+                        let image_index = self
+                                .swapchain
+                                .acquire_image(
+                                        core::u64::MAX,
+                                        FrameSync::Semaphore(image_available),
+                                )
+                                .map_err(|_| "Couldn't acquire an image from the swapchain!")?;
+                        (image_index, image_index as usize)
+                };
+
+                // Remember that the swap chain doesn't prevent us from writing to multiple images at once.
+                // The image we want to present could be being written to so we have to wait.
+                // It's nice that we don't have to reset a fence the moment it is done (fences have downtime)
+                let flight_fence = &self.in_flight_fences[i_usize];
+                unsafe {
+                        self.device
+                                .wait_for_fence(flight_fence, core::u64::MAX)
+                                .map_err(|_| "Failed to wait on fence!")?;
+                        self.device
+                                .reset_fence(flight_fence)
+                                .map_err(|_| "Couldn't reset the fence!")?;
+                }
+
+                // Write the Triangle Data
+                unsafe {
+                        let mut data_target = self
+                                .device
+                                .acquire_mapping_writer(&self.memory, 0..self.requirements.size)
+                                .map_err(|_| "Failed to acquire a memory writer!")?;
+                        let points = triangle.points_flat();
+                        data_target[..points.len()].copy_from_slice(&points);
+                        self.device
+                                .release_mapping_writer(data_target)
+                                .map_err(|_| "Couldn't release the mapping writer!")?;
+                }
+
+                // RECORD COMMANDS
+                unsafe {
+                        let buffer = &mut self.command_buffers[i_usize];
+                        const TRIANGLE_CLEAR: [ClearValue; 1] =
+                                [ClearValue::Color(ClearColor::Float([0.1, 0.2, 0.3, 1.0]))];
+                        buffer.begin(false);
+                        {
+                                let mut encoder = buffer.begin_render_pass_inline(
+                                        &self.render_pass,
+                                        &self.framebuffers[i_usize],
+                                        self.render_area,
+                                        TRIANGLE_CLEAR.iter(),
+                                );
+                                encoder.bind_graphics_pipeline(&self.graphics_pipeline);
+                                let buffer_ref: &<back::Backend as Backend>::Buffer = &self.buffer;
+                                let buffers: ArrayVec<[_; 1]> = [(buffer_ref, 0)].into();
+                                encoder.bind_vertex_buffers(0, buffers);
+                                encoder.draw(0..3, 0..1);
+                        }
+                        buffer.finish();
+                }
+
+                // SUBMISSION AND PRESENT
+                let command_buffers = &self.command_buffers[i_usize..=i_usize];
+                let wait_semaphores: ArrayVec<[_; 1]> =
+                        [(image_available, PipelineStage::COLOR_ATTACHMENT_OUTPUT)].into();
+                let signal_semaphores: ArrayVec<[_; 1]> = [render_finished].into();
+                let present_wait_semaphores: ArrayVec<[_; 1]> = [render_finished].into();
+                let submission = Submission {
+                        command_buffers,
+                        wait_semaphores,
+                        signal_semaphores,
+                };
+
+                let the_command_queue = &mut self.queue_group.queues[0];
+                unsafe {
+                        the_command_queue.submit(submission, Some(flight_fence));
+                        self.swapchain
+                                .present(the_command_queue, i_u32, present_wait_semaphores)
+                                .map_err(|_| "Failed to present into the swapchain!")
+                }
+        }
 }
 impl core::ops::Drop for HalState {
         /// We have to clean up "leaf" elements before "root" elements. Basically, we
@@ -430,6 +826,10 @@ impl core::ops::Drop for HalState {
         fn drop(&mut self) {
                 let _ = self.device.wait_idle();
                 unsafe {
+                        for descriptor_set_layout in self.descriptor_set_layouts.drain(..) {
+                                self.device
+                                        .destroy_descriptor_set_layout(descriptor_set_layout)
+                        }
                         for fence in self.in_flight_fences.drain(..) {
                                 self.device.destroy_fence(fence)
                         }
@@ -447,6 +847,18 @@ impl core::ops::Drop for HalState {
                         }
                         // LAST RESORT STYLE CODE, NOT TO BE IMITATED LIGHTLY
                         use core::ptr::read;
+                        self.device
+                                .destroy_buffer(ManuallyDrop::into_inner(read(&self.buffer)));
+                        self.device
+                                .free_memory(ManuallyDrop::into_inner(read(&self.memory)));
+                        self.device
+                                .destroy_pipeline_layout(ManuallyDrop::into_inner(read(
+                                        &self.pipeline_layout
+                                )));
+                        self.device
+                                .destroy_graphics_pipeline(ManuallyDrop::into_inner(read(
+                                        &self.graphics_pipeline
+                                )));
                         self.device.destroy_command_pool(
                                 ManuallyDrop::into_inner(read(&self.command_pool)).into_raw(),
                         );
@@ -553,12 +965,24 @@ impl LocalState {
         }
 }
 
-fn do_the_render(hal_state: &mut HalState, local_state: &LocalState) -> Result<(), &'static str> {
+fn _do_the_render_clear(
+        hal_state: &mut HalState,
+        local_state: &LocalState,
+) -> Result<(), &'static str> {
         let r = (local_state.mouse_x / local_state.frame_width) as f32;
         let g = (local_state.mouse_y / local_state.frame_height) as f32;
         let b = (r + g) * 0.3;
         let a = 1.0;
         hal_state.draw_clear_frame([r, g, b, a])
+}
+
+fn do_the_render(hal_state: &mut HalState, local_state: &LocalState) -> Result<(), &'static str> {
+        let x = ((local_state.mouse_x / local_state.frame_width) * 2.0) - 1.0;
+        let y = ((local_state.mouse_y / local_state.frame_height) * 2.0) - 1.0;
+        let triangle = Triangle {
+                points: [[-0.5, 0.5], [-0.5, 0.5], [x as f32, y as f32]],
+        };
+        hal_state.draw_triangle_frame(triangle)
 }
 
 fn main() {

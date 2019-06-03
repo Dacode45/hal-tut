@@ -5,7 +5,7 @@ authors = ["David Ayeke"]
 edition = "2018"
 
 [features]
-default = []
+default = ["gfx-backend-metal"]
 metal = ["gfx-backend-metal"]
 dx12 = ["gfx-backend-dx12"]
 vulkan = ["gfx-backend-vulkan"]
